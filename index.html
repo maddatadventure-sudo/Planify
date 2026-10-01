@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Family Calendar</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<style>
+body{font-family:system-ui,sans-serif;max-width:640px;margin:0 auto;padding:16px;color:#222}
+input,textarea{font:inherit;padding:8px;margin:4px 0;width:100%;box-sizing:border-box}
+button{font:inherit;padding:8px 14px;margin:4px 4px 4px 0;cursor:pointer}
+.card{border:1px solid #ddd;border-radius:8px;padding:12px;margin:10px 0}
+.muted{color:#666;font-size:.85em}
+.row{display:flex;gap:8px;align-items:center;justify-content:space-between}
+</style></head><body>
+<div id="app"></div>
+<script>
+// ====== PASTE YOUR TWO VALUES HERE (Supabase > Project Settings > API) ======
+const SUPABASE_URL = 'PASTE_PROJECT_URL';
+const SUPABASE_KEY = 'PASTE_ANON_OR_PUBLISHABLE_KEY';
+// ============================================================================
+const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const A = document.getElementById('app'), g = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = d => new Date(d).toLocaleString([], {dateStyle:'medium', timeStyle:'short'});
+const FREE_LIMIT = 5;
+let me, group, E = [], P = {};
+
+async function start() {
+  const { data: { session } } = await db.auth.getSession();
+  if (!session) return loginView();
+  me = session.user;
+  await db.rpc('accept_invites');
+  groupsView();
+}
+
+function loginView() {
+  A.innerHTML = `<h2>Family Calendar</h2><p>Enter your email and we'll send you a login link.</p>
+  <input id="em" type="email" placeholder="you@email.com"><button id="go">Send login link</button><p id="msg" class="muted"></p>`;
+  g('go').onclick = async () => {
+    const { error } = await db.auth.signInWithOtp({ email: g('em').value.trim(), options: { emailRedirectTo: location.origin } });
+    g('msg').textContent = error ? error.message : 'Check your email and click the link.';
+  };
+}
+
+async function groupsView() {
+  const [gs, pr] = await Promise.all([
+    db.from('groups').select('id,name').order('created_at'),
+    db.from('profiles').select('name').eq('id', me.id).single()]);
+  A.innerHTML = `<div class="row"><h2>Your groups</h2><button id="out">Log out</button></div>
+  ${(gs.data || []).map(x => `<div class="card row"><b>${esc(x.name)}</b><button onclick="openGroup('${x.id}','${esc(x.name)}')">Open</button></div>`).join('') || '<p class="muted">No groups yet.</p>'}
+  <h3>New group</h3><input id="gn" placeholder="Family, Soccer team, Trip...">
+  <button id="cg">Create group</button>
+  <h3>Your name (shown in edit history)</h3><input id="nm" value="${esc(pr.data?.name)}"><button id="sn">Save name</button>`;
+  g('out').onclick = async () => { await db.auth.signOut(); location.reload(); };
+  g('sn').onclick = async () => { await db.from('profiles').update({ name: g('nm').value.trim() }).eq('id', me.id); alert('Saved'); };
+  g('cg').onclick = async () => {
+    const n = g('gn').value.trim(); if (!n) return;
+    const { data, error } = await db.from('groups').insert({ name: n }).select().single();
+    if (error) return alert(error.message);
+    const r = await db.from('group_members').insert({ group_id: data.id, user_id: me.id });
+    if (r.error) return alert(r.error.message);
+    groupsView();
+  };
+}
+
+function openGroup(id, name) { group = { id, name }; groupView(); }
+
+async function groupView() {
+  const [m, e, i, p, r, h] = await Promise.all([
+    db.from('group_members').select('user_id').eq('group_id', group.id),
+    db.from('events').select('*').eq('group_id', group.id).order('starts_at'),
+    db.from('group_invites').select('email').eq('group_id', group.id),
+    db.from('profiles').select('id,name,email'),
+    db.from('event_rsvps').select('*'),
+    db.from('event_history').select('*').order('created_at', { ascending: false })]);
+  E = e.data || []; P = {}; (p.data || []).forEach(x => P[x.id] = x);
+  const ms = m.data || [], iv = i.data || [], ids = E.map(x => x.id);
+  const rs = (r.data || []).filter(x => ids.includes(x.event_id));
+  const hs = (h.data || []).filter(x => ids.includes(x.event_id));
+  const nm = id => esc(P[id]?.name || P[id]?.email || 'someone');
+  const who = (eid, s) => rs.filter(x => x.event_id === eid && x.status === s).map(x => nm(x.user_id)).join(', ') || '–';
+  A.innerHTML = `<button onclick="groupsView()">← Groups</button><h2>${esc(group.name)}</h2>
+  <p class="muted">Members: ${ms.map(x => nm(x.user_id)).join(', ')}${iv.length ? ' · Invited: ' + iv.map(x => esc(x.email)).join(', ') : ''}</p>
+  <input id="ie" type="email" placeholder="Invite by email"><button id="inv">Invite</button><p id="im" class="muted"></p>
+  <h3>Events</h3>
+  ${E.map(ev => `<div class="card"><b>${esc(ev.title)}</b><br>${fmt(ev.starts_at)}
+    ${ev.location ? `<br>📍 <a target="_blank" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(ev.location)}">${esc(ev.location)}</a>` : ''}
+    ${ev.description ? `<br>${esc(ev.description)}` : ''}
+    <p class="muted">Last edited by ${nm(ev.updated_by)}, ${fmt(ev.updated_at)}</p>
+    <div class="muted">Yes: ${who(ev.id, 'yes')} · Maybe: ${who(ev.id, 'maybe')} · No: ${who(ev.id, 'no')}</div>
+    <button onclick="rsvp('${ev.id}','yes')">Yes</button><button onclick="rsvp('${ev.id}','maybe')">Maybe</button><button onclick="rsvp('${ev.id}','no')">No</button>
+    <button onclick="editEv('${ev.id}')">Edit</button>
+    <details><summary class="muted">Edit history</summary>${hs.filter(x => x.event_id === ev.id).map(x => `<div class="muted">${nm(x.user_id)} · ${fmt(x.created_at)}: ${esc(x.summary)}</div>`).join('')}</details></div>`).join('') || '<p class="muted">No events yet.</p>'}
+  <div class="card" id="form"><b id="ft">Add event</b><input type="hidden" id="eid">
+  <input id="t" placeholder="Title"><input id="s" type="datetime-local"><input id="l" placeholder="Location"><textarea id="d" placeholder="Description"></textarea>
+  <button id="sv">Save event</button></div>`;
+  g('inv').onclick = async () => {
+    const em = g('ie').value.trim().toLowerCase(); if (!em) return;
+    if (ms.length + iv.length >= FREE_LIMIT) return g('im').textContent = 'Free groups are limited to 5 people. Upgrade to add more (coming soon).';
+    const { error } = await db.from('group_invites').insert({ group_id: group.id, email: em });
+    if (error) return g('im').textContent = error.message;
+    g('im').textContent = `Invited! Ask them to log in at ${location.origin} with ${em}.`;
+  };
+  g('sv').onclick = saveEv;
+}
+
+function editEv(id) {
+  const ev = E.find(x => x.id === id);
+  g('ft').textContent = 'Edit event'; g('eid').value = id; g('t').value = ev.title; g('l').value = ev.location || ''; g('d').value = ev.description || '';
+  const d = new Date(ev.starts_at); g('s').value = new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  g('form').scrollIntoView();
+}
+
+async function saveEv() {
+  if (!g('t').value.trim() || !g('s').value) return alert('Title and start time are needed');
+  const f = { title: g('t').value.trim(), location: g('l').value.trim(), description: g('d').value.trim(), starts_at: new Date(g('s').value).toISOString() };
+  const id = g('eid').value;
+  if (!id) {
+    const { data, error } = await db.from('events').insert({ ...f, group_id: group.id }).select().single();
+    if (error) return alert(error.message);
+    await db.from('event_history').insert({ event_id: data.id, summary: 'Created the event' });
+  } else {
+    const o = E.find(x => x.id === id), ch = [];
+    if (o.title !== f.title) ch.push(`title "${o.title}" → "${f.title}"`);
+    if ((o.location || '') !== f.location) ch.push(`location "${o.location || ''}" → "${f.location}"`);
+    if ((o.description || '') !== f.description) ch.push('description');
+    if (new Date(o.starts_at).getTime() !== new Date(f.starts_at).getTime()) ch.push(`time ${fmt(o.starts_at)} → ${fmt(f.starts_at)}`);
+    const { error } = await db.from('events').update({ ...f, updated_by: me.id, updated_at: new Date().toISOString() }).eq('id', id);
+    if (error) return alert(error.message);
+    if (ch.length) await db.from('event_history').insert({ event_id: id, summary: 'Changed ' + ch.join('; ') });
+  }
+  groupView();
+}
+
+async function rsvp(eid, s) {
+  await db.from('event_rsvps').upsert({ event_id: eid, user_id: me.id, status: s });
+  groupView();
+}
+
+start();
+</script></body></html>
