@@ -1,0 +1,175 @@
+-- =========================================================
+-- Shared calendar app: database setup (Supabase / Postgres)
+-- Paste this whole file into Supabase > SQL Editor > Run
+-- =========================================================
+
+-- ---------- TABLES ----------
+
+-- One row per person (filled automatically when someone signs up)
+create table profiles (
+  id uuid primary key references auth.users on delete cascade,
+  name text,
+  email text
+);
+
+-- A group = a family, a team, a trip...
+create table groups (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  owner_id uuid not null references auth.users default auth.uid(),
+  created_at timestamptz default now()
+);
+
+-- Who belongs to which group
+create table group_members (
+  group_id uuid references groups on delete cascade,
+  user_id uuid references auth.users on delete cascade,
+  joined_at timestamptz default now(),
+  primary key (group_id, user_id)
+);
+
+-- Emails that have been invited but have not joined yet
+create table group_invites (
+  id uuid primary key default gen_random_uuid(),
+  group_id uuid not null references groups on delete cascade,
+  email text not null,
+  invited_by uuid references auth.users default auth.uid(),
+  created_at timestamptz default now(),
+  unique (group_id, email)
+);
+
+-- Calendar events
+create table events (
+  id uuid primary key default gen_random_uuid(),
+  group_id uuid not null references groups on delete cascade,
+  title text not null,
+  description text,
+  location text,
+  starts_at timestamptz not null,
+  ends_at timestamptz,
+  created_by uuid references auth.users default auth.uid(),
+  updated_by uuid references auth.users default auth.uid(),
+  updated_at timestamptz default now()
+);
+
+-- Confirm / decline attendance
+create table event_rsvps (
+  event_id uuid references events on delete cascade,
+  user_id uuid references auth.users default auth.uid(),
+  status text not null check (status in ('yes', 'no', 'maybe')),
+  primary key (event_id, user_id)
+);
+
+-- "Who edited what, and when"
+create table event_history (
+  id bigserial primary key,
+  event_id uuid not null references events on delete cascade,
+  user_id uuid references auth.users default auth.uid(),
+  summary text not null,
+  created_at timestamptz default now()
+);
+
+-- ---------- HELPER FUNCTION ----------
+
+-- True if the logged-in person belongs to the given group
+create function is_member(gid uuid) returns boolean
+language sql security definer stable set search_path = public as $$
+  select exists (
+    select 1 from group_members
+    where group_id = gid and user_id = auth.uid()
+  );
+$$;
+
+-- ---------- SECURITY (who can see / change what) ----------
+
+alter table profiles      enable row level security;
+alter table groups        enable row level security;
+alter table group_members enable row level security;
+alter table group_invites enable row level security;
+alter table events        enable row level security;
+alter table event_rsvps   enable row level security;
+alter table event_history enable row level security;
+
+-- profiles: see yourself and people who share a group with you
+create policy "read profiles" on profiles for select to authenticated
+  using (
+    id = auth.uid()
+    or exists (
+      select 1 from group_members a
+      join group_members b on a.group_id = b.group_id
+      where a.user_id = auth.uid() and b.user_id = profiles.id
+    )
+  );
+create policy "update own profile" on profiles for update to authenticated
+  using (id = auth.uid());
+
+-- groups: members can see; anyone logged in can create; only owner changes
+create policy "read groups" on groups for select to authenticated
+  using (is_member(id) or owner_id = auth.uid());
+create policy "create groups" on groups for insert to authenticated
+  with check (owner_id = auth.uid());
+create policy "owner updates groups" on groups for update to authenticated
+  using (owner_id = auth.uid());
+create policy "owner deletes groups" on groups for delete to authenticated
+  using (owner_id = auth.uid());
+
+-- group_members: members can see each other; owner can add themselves
+-- (joining through an invite will be handled later by a secure function)
+create policy "read members" on group_members for select to authenticated
+  using (is_member(group_id));
+create policy "owner adds self" on group_members for insert to authenticated
+  with check (
+    user_id = auth.uid()
+    and exists (select 1 from groups where id = group_id and owner_id = auth.uid())
+  );
+
+-- group_invites: members can see and create invites
+create policy "read invites" on group_invites for select to authenticated
+  using (is_member(group_id));
+create policy "create invites" on group_invites for insert to authenticated
+  with check (is_member(group_id));
+
+-- events: every member of the group can read, add, edit and delete
+create policy "members read events" on events for select to authenticated
+  using (is_member(group_id));
+create policy "members add events" on events for insert to authenticated
+  with check (is_member(group_id));
+create policy "members edit events" on events for update to authenticated
+  using (is_member(group_id));
+create policy "members delete events" on events for delete to authenticated
+  using (is_member(group_id));
+
+-- event_rsvps: members see all answers; you can only set your own
+create policy "members read rsvps" on event_rsvps for select to authenticated
+  using (exists (select 1 from events e where e.id = event_id and is_member(e.group_id)));
+create policy "set own rsvp" on event_rsvps for insert to authenticated
+  with check (
+    user_id = auth.uid()
+    and exists (select 1 from events e where e.id = event_id and is_member(e.group_id))
+  );
+create policy "change own rsvp" on event_rsvps for update to authenticated
+  using (user_id = auth.uid());
+
+-- event_history: members can read and add entries
+create policy "members read history" on event_history for select to authenticated
+  using (exists (select 1 from events e where e.id = event_id and is_member(e.group_id)));
+create policy "members add history" on event_history for insert to authenticated
+  with check (
+    user_id = auth.uid()
+    and exists (select 1 from events e where e.id = event_id and is_member(e.group_id))
+  );
+
+-- ---------- AUTO-CREATE PROFILE ON SIGN-UP ----------
+
+create function handle_new_user() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  insert into profiles (id, email, name)
+  values (new.id, new.email, split_part(new.email, '@', 1));
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function handle_new_user();
